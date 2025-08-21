@@ -4,86 +4,110 @@ import time
 import serial
 import websockets
 
-ROBOT_SERIAL_PORT = '/tmp/robot_write'
+ROBOT_SERIAL_PORT = '/dev/ttyUSB0'  # adjust if needed (e.g., 'COM3' on Windows)
 ROBOT_BAUD_RATE = 9600
 WEBSOCKET_PORT = 50051
 
 
 class HandController:
     def __init__(self):
-        self.robot_serial = None
         self.message_count = 0
-        self.total_e2e_latency = 0
+        self.total_e2e_latency = 0.0
         self.start_time = None
-        self._initialize_serial()
+        self.robot_serial = self._initialize_serial()
 
     def _initialize_serial(self):
         try:
-            self.robot_serial = serial.Serial(ROBOT_SERIAL_PORT, ROBOT_BAUD_RATE, timeout=1)
-            print(f"Robot bağlandı: {ROBOT_SERIAL_PORT}")
-        except serial.SerialException as e:
-            print(f"Robot bağlantı hatası: {e}")
+            ser = serial.Serial(ROBOT_SERIAL_PORT, ROBOT_BAUD_RATE, timeout=1)
+            print(f"Serial opened: {ROBOT_SERIAL_PORT} @ {ROBOT_BAUD_RATE}")
+            return ser
+        except Exception as e:
+            print(f"Serial error: {e}")
+            return None
 
     async def handle_client(self, websocket):
-        print("Client ile bağlantı kuruldu.")
+        print("Client connected.")
         self.start_time = time.time()
-
         try:
             async for message in websocket:
-                # Parse the JSON data from client
-                hand_data = json.loads(message)
-                self._process_data(hand_data)
+                # Parse one frame
+                try:
+                    hand_data = json.loads(message)
+                except json.JSONDecodeError:
+                    await websocket.send(json.dumps({"ok": False, "error": "invalid_json"}))
+                    continue
 
-            # Send acknowledgment when complete
-            await websocket.send(json.dumps({"success": True}))
+                # Process (serial write, metrics)
+                await self._process_data(hand_data)
+
+                # ✅ Send ACK **for every message**
+                ack = {
+                    "ok": True,
+                    "seq": self.message_count,
+                    "ts_ms": int(time.time() * 1000),
+                }
+                await websocket.send(json.dumps(ack))
+
+        except websockets.exceptions.ConnectionClosedOK:
+            print("Client closed connection (OK).")
+        except websockets.exceptions.ConnectionClosedError as e:
+            print(f"Connection closed with error: {e}")
         except Exception as e:
-            print(f"Hata: {e}")
+            print(f"Server error: {e}")
+        finally:
+            if self.message_count > 0 and self.start_time is not None:
+                total_time = time.time() - self.start_time
+                avg_e2e_latency = self.total_e2e_latency / self.message_count
+                throughput = self.message_count / total_time if total_time > 0 else 0.0
+                print(
+                    f"Total: {self.message_count} msgs | Duration: {total_time:.2f}s | "
+                    f"Avg E2E: {avg_e2e_latency:.2f}ms | Throughput: {throughput:.1f} msg/s"
+                )
 
-        if self.message_count > 0:
-            total_time = time.time() - self.start_time
-            avg_e2e_latency = self.total_e2e_latency / self.message_count
-            throughput = self.message_count / total_time
-            print(
-                f"Toplam: {self.message_count} mesaj, Süre: {total_time:.2f}s, Ort E2E: {avg_e2e_latency:.2f}ms, Throughput: {throughput:.1f} msg/s")
-
-    def _process_data(self, hand_data):
+    async def _process_data(self, hand_data):
+        """
+        Convert finger_values -> serial line for the robot, track E2E latency.
+        """
         self.message_count += 1
 
-        # End-to-end latency hesapla
-        current_time_ms = int(time.time() * 1000)
-        end_to_end_latency = current_time_ms - hand_data["timestamp_ms"]
-        self.total_e2e_latency += end_to_end_latency
-        avg_e2e_latency = self.total_e2e_latency / self.message_count
+        # Metrics
+        now_ms = int(time.time() * 1000)
+        sent_ts = int(hand_data.get("timestamp_ms", now_ms))
+        e2e = max(0, now_ms - sent_ts)
+        self.total_e2e_latency += e2e
 
-        # Servo değerleri al
-        servo_values = hand_data["finger_values"]
+        # Extract servo targets
+        servo_values = hand_data.get("finger_values")
+        if not isinstance(servo_values, list) or len(servo_values) != 5:
+            # ignore malformed frames
+            return
 
-        # Arduino'ya gönder
+        # Write to robot over serial
         if self.robot_serial and self.robot_serial.is_open:
-            command = ",".join(map(str, servo_values)) + "\n"
-            self.robot_serial.write(command.encode('utf-8'))
+            line = ",".join(map(str, servo_values)) + "\n"
+            try:
+                self.robot_serial.write(line.encode("utf-8"))
+                self.robot_serial.flush()
+            except Exception as e:
+                # Don't crash the server if serial hiccups
+                print(f"Serial write error: {e}")
 
-        # Throughput hesapla
-        elapsed = time.time() - self.start_time
-        throughput = self.message_count / elapsed if elapsed > 0 else 0
-
-        # Her 50 mesajda bir göster
-        if self.message_count % 50 == 0:
-            print(
-                f"SERVER #{self.message_count:04d} | {throughput:.1f} msg/s | E2E: {end_to_end_latency}ms | Ort E2E: {avg_e2e_latency:.1f}ms | Servolar: {servo_values}")
+        # Throttle a little if you need to avoid overruns on Arduino
+        await asyncio.sleep(0.01)  # 10ms
 
 
 async def serve():
     controller = HandController()
-
-    async with websockets.serve(controller.handle_client, "0.0.0.0", WEBSOCKET_PORT):
-        print(f"Server başladı - Port: {WEBSOCKET_PORT}")
-        print("Client bekleniyor...")
-
+    async with websockets.serve(controller.handle_client, "0.0.0.0", WEBSOCKET_PORT, ping_interval=20, ping_timeout=20):
+        print(f"Server started - Port: {WEBSOCKET_PORT}")
+        print("Waiting for clients...")
         try:
-            await asyncio.Future()  # Run forever
-        except KeyboardInterrupt:
-            print("Server kapatılıyor...")
+            await asyncio.Future()  # run forever
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if controller.robot_serial and controller.robot_serial.is_open:
+                controller.robot_serial.close()
 
 
 if __name__ == '__main__':

@@ -1,106 +1,114 @@
 import asyncio
 import json
 import time
-import serial
+import sys
+import contextlib
 import websockets
 
-GLOVE_SERIAL_PORT = '/tmp/glove_read'
-GLOVE_BAUD_RATE = 115200
-SERVER_ADDRESS = 'local,host'
+SERVER_ADDRESS = 'raspberrypi'  # or IP/hostname
 SERVER_PORT = 50051
 
+# --- Async, non-blocking line reader (does NOT block event loop) ---
+async def readline():
+    # Use a background thread to avoid blocking asyncio loop
+    line = await asyncio.to_thread(sys.stdin.readline)
+    if not line:
+        # EOF (Ctrl+D)
+        return None
+    return line.rstrip("\n")
 
-def parse_hand_data(line):
-    try:
-        parts = line.split(',')
-        if len(parts) == 5:
-            finger_values = list(map(int, parts))
-            return finger_values
-    except (ValueError, IndexError):
-        pass
-    return None
-
-
-async def send_hand_data(websocket, serial_port):
+async def send_hand_data(websocket):
+    """
+    Read user input lines asynchronously and send to server.
+    Type 'q' to quit.
+    """
     message_count = 0
     start_time = time.time()
 
     while True:
         try:
-            line = serial_port.readline().decode('utf-8').strip()
-            if not line:
+            print("Enter 5 comma-separated finger values (0-1023), or 'q' to quit: ", end="", flush=True)
+            line = await readline()
+            if line is None:
+                # stdin closed
+                break
+
+            line = line.strip()
+            if line.lower() == 'q':
+                break
+
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) != 5:
+                print("\nInvalid input. Please enter 5 values.")
                 continue
 
-            finger_values = parse_hand_data(line)
-            if finger_values:
-                message_count += 1
+            finger_values = list(map(int, parts))
+            if not all(0 <= v <= 1023 for v in finger_values):
+                print("\nAll values must be between 0 and 1023.")
+                continue
 
-                # Rate hesapla
-                elapsed = time.time() - start_time
-                rate = message_count / elapsed if elapsed > 0 else 0
+            message_count += 1
+            elapsed = time.time() - start_time
+            rate = message_count / elapsed if elapsed > 0 else 0.0
 
-                if message_count % 50 == 0:
-                    print(f"CLIENT #{message_count:04d} | {rate:.1f} msg/s | Parmaklar: {finger_values}")
+            if message_count % 50 == 0:
+                print(f"\nCLIENT #{message_count:04d} | {rate:.1f} msg/s | Fingers: {finger_values}")
 
-                # Timestamp ekle
-                timestamp_ms = int(time.time() * 1000)
+            payload = {
+                "finger_values": finger_values,
+                "timestamp_ms": int(time.time() * 1000),
+            }
+            await websocket.send(json.dumps(payload))
 
-                # Create JSON data
-                hand_data = {
-                    "finger_values": finger_values,
-                    "timestamp_ms": timestamp_ms
-                }
-
-                # Send as JSON
-                await websocket.send(json.dumps(hand_data))
-            else:
-                print(f"Geçersiz veri: {line}")
-
-        except (UnicodeDecodeError, ValueError) as e:
-            print(f"Parse hatası: {e}")
-            continue
-        except serial.SerialException as e:
-            print(f"Serial hatası: {e}")
+        except ValueError:
+            print("\nInvalid input. Please enter integers.")
+        except (EOFError, KeyboardInterrupt):
             break
 
+async def listen_responses(websocket):
+    """
+    Concurrently read server acknowledgments (keeps WS pump alive too).
+    """
+    try:
+        async for msg in websocket:
+            try:
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                print("\nServer replied (non-JSON):", msg)
+                continue
+
+            print(f"\nServer ACK: {data}")
+    except websockets.exceptions.ConnectionClosed:
+        # normal or error closure
+        pass
 
 async def main():
-    print(f"Client başlatılıyor...")
-    print(f"Eldiven portu: {GLOVE_SERIAL_PORT}")
+    print(f"Client starting...")
     print(f"Server: {SERVER_ADDRESS}:{SERVER_PORT}")
-    print("Server hazır olduğunda Enter'a basın:")
-    input()
+    uri = f"ws://{SERVER_ADDRESS}:{SERVER_PORT}"
 
+    # Reasonable keepalive; pings are handled by the library as long as the loop isn't blocked
     try:
-        glove_serial = serial.Serial(GLOVE_SERIAL_PORT, GLOVE_BAUD_RATE)
-        print(f"Eldiven bağlandı: {GLOVE_SERIAL_PORT}")
-    except serial.SerialException as e:
-        print(f"Eldiven bağlantı hatası: {e}")
-        return
+        async with websockets.connect(
+            uri,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_queue=None,   # don't artificially backpressure
+        ) as websocket:
+            print("Connected to server")
 
-    try:
-        uri = f"ws://{SERVER_ADDRESS}:{SERVER_PORT}"
-        start_time = time.time()
+            sender = asyncio.create_task(send_hand_data(websocket))
+            listener = asyncio.create_task(listen_responses(websocket))
 
-        async with websockets.connect(uri) as websocket:
-            print("Server'a bağlandı")
-            await send_hand_data(websocket, glove_serial)
+            await sender
+            # After user quits sending, cancel listener and close
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
 
-            # Receive acknowledgment
-            response = await websocket.recv()
-            end_time = time.time()
-
-            print(f"Tamamlandı. Süre: {end_time - start_time:.2f}s")
-
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"WebSocket bağlantısı kapandı: {e}")
     except Exception as e:
-        print(f"Hata: {e}")
-    finally:
-        if glove_serial.is_open:
-            glove_serial.close()
-            print("Serial port kapatıldı")
-
+        print(f"Error: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())

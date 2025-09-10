@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Peer-to-Peer</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #ffffff; 
+      min-height: 100vh; 
+      margin: 0; 
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .finger {
+      margin: 20px;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 10px;
+      display: inline-block;
+      width: 200px;
+      height: 50px;
+      background-color: rgba(255, 255, 255, 0.2); 
+      box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1);
+      color: #ffffff; 
+    }
+    .finger h2 {
+      margin: 0;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      border: none;
+      border-radius: 5px;
+      background-color: #ffffff;
+      color: #764ba2;
+      cursor: pointer;
+      box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.2);
+      transition: background-color 0.3s, color 0.3s;
+    }
+    button:hover {
+      background-color: #764ba2;
+      color: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <h1>REMOTE ROBOTIC HAND CONTROLLER</h1>
+  <div id="fingers-container">
+    <div class="finger" id="finger1"><h2>Finger 1</h2><p id="finger1-value">-</p></div>
+    <div class="finger" id="finger2"><h2>Finger 2</h2><p id="finger2-value">-</p></div>
+    <div class="finger" id="finger3"><h2>Finger 3</h2><p id="finger3-value">-</p></div>
+    <div class="finger" id="finger4"><h2>Finger 4</h2><p id="finger4-value">-</p></div>
+    <div class="finger" id="finger5"><h2>Finger 5</h2><p id="finger5-value">-</p></div>
+  </div>
+  <button id="connect">Connect Bluetooth</button>
+
+  <!-- >>> RTT  <<< -->
+  <p id="average-delay" style="margin-top: 20px;">Average Delay: - ms</p>
+
+  <script>
+    const signalingServerUrl = "wss://kync.live";
+    const ws = new WebSocket(signalingServerUrl);
+
+    const iceServers = [
+      { "urls": "turns:kync.live:5349?transport=udp", "username": "yahya", "credential": "oguzhan" }   
+    ];
+
+    let peerConnection = new RTCPeerConnection({ iceServers,iceTransportPolicy:"relay" });
+    let dataChannel;
+    let buffer = "";
+
+    const fingerElements = [
+      document.getElementById("finger1-value"),
+      document.getElementById("finger2-value"),
+      document.getElementById("finger3-value"),
+      document.getElementById("finger4-value"),
+      document.getElementById("finger5-value"),
+    ];
+
+    const connectButton = document.getElementById("connect");
+    const averageDelayElement = document.getElementById("average-delay"); 
+
+    let rttSum = 0;
+    let rttCount = 0;
+
+    ws.onmessage = async (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === "offer") {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        ws.send(JSON.stringify(peerConnection.localDescription));
+      } else if (data.type === "answer") {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+      } else if (data.type === "candidate") {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+      }
+    };
+
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        ws.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
+      }
+    };
+
+    peerConnection.ondatachannel = (event) => {
+      dataChannel = event.channel;
+      dataChannel.onmessage = (event) => {
+        console.log("Message received from Peer:", event.data);
+
+        if (event.data.startsWith("ack ")) {
+          const parts = event.data.split(" ");
+          const sentTimestamp = parseInt(parts[1], 10);
+          if (!isNaN(sentTimestamp)) {
+            const now = Date.now();
+            const rtt = now - sentTimestamp; 
+            rttSum += rtt;
+            rttCount++;
+            const avg = (rttSum / rttCount).toFixed(2);
+            averageDelayElement.textContent = `Average Delay: ${avg} ms`;
+          }
+        }
+      };
+    };
+
+    const createDataChannel = () => {
+      dataChannel = peerConnection.createDataChannel("fingerData");
+
+      dataChannel.onmessage = (event) => {
+        console.log("Message received from Peer:", event.data);
+
+        if (event.data.startsWith("ack ")) {
+          const parts = event.data.split(" ");
+          const sentTimestamp = parseInt(parts[1], 10);
+          if (!isNaN(sentTimestamp)) {
+            const now = Date.now();
+            const rtt = now - sentTimestamp; 
+            rttSum += rtt;
+            rttCount++;
+            const avg = (rttSum / rttCount).toFixed(2);
+            averageDelayElement.textContent = `Average Delay: ${avg} ms`;
+          }
+        }
+      };
+    };
+
+    const startConnection = async () => {
+      createDataChannel();
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      ws.send(JSON.stringify(peerConnection.localDescription));
+    };
+
+    ws.onopen = startConnection;
+
+    connectButton.addEventListener("click", async () => {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: "HC-08" }],
+          optionalServices: ["0000ffe0-0000-1000-8000-00805f9b34fb"],
+        });
+
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService("0000ffe0-0000-1000-8000-00805f9b34fb");
+        const characteristic = await service.getCharacteristic("0000ffe1-0000-1000-8000-00805f9b34fb");
+
+        characteristic.startNotifications();
+        characteristic.addEventListener("characteristicvaluechanged", handleCharacteristicValueChanged);
+
+        console.log("Connected to Bluetooth device.");
+      } catch (error) {
+        console.error("Bluetooth connection error:", error);
+      }
+    });
+
+    const handleCharacteristicValueChanged = (event) => {
+      buffer += new TextDecoder().decode(event.target.value);
+
+      if (buffer.split(" ").length >= 6) {
+        processBuffer();
+      }
+    };
+
+    const processBuffer = () => {
+      const valuesArray = buffer.split(" ");
+
+      for (let i = 0; i < 5; i++) {
+        fingerElements[i].textContent = valuesArray[i] || "-"; 
+      }
+
+      buffer = valuesArray.slice(5).join(" ");
+
+      if (dataChannel && dataChannel.readyState === "open") {
+        const now = Date.now();
+        const fingerData = valuesArray.slice(0, 5).join(" ");
+        const messageToSend = `fingerData ${now} ${fingerData}`;
+        dataChannel.send(messageToSend);
+      }
+    };
+  </script>
+</body>
+</html>

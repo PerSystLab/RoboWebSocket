@@ -73,7 +73,7 @@ class SimpleHandSimulator:
         print("Simülatör başlıyor...")
         
         try:
-            self.serial_port = serial.Serial('/tmp/glove_write', 9600, timeout=1)
+            self.serial_port = serial.Serial('COM4', 9600, timeout=1)
             print("Port açıldı")
         except Exception as e:
             print(f"Port hatası: {e}")

@@ -8,9 +8,9 @@ import sys
 import serial
 
 # Configuration
-SERVER_ADDRESS = 'raspberrypi'
+SERVER_ADDRESS = '192.168.20.101'
 SERVER_PORT = 50051
-SIMULATOR_PORT = 'COM3'
+SIMULATOR_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 9600
 
 
